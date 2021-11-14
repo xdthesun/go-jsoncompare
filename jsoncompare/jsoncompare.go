@@ -3,6 +3,7 @@ package jsoncompare
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -11,51 +12,53 @@ type PathDiff struct {
 	PathLeft   string
 	PathRight  string
 	IsEqual    bool
+	IsIgnored  bool
 	ValueLeft  interface{}
 	ValueRight interface{}
 }
 
 type path struct {
-	path   string      // from top to elemnt likes: "/user/email/0/login"
-	mytype string      // "map", "slice", "value"
-	value  interface{} // Vvalue of element. There is len(value) if mytype is maps or slices.
+	path      string      // from top to element likes: "/user/email/0/login"
+	valueType string      // "map", "slice", "value"
+	value     interface{} // Value of element. There is len(value) if valueType is maps or slices.
 }
 
-func SplitBySide(list []*PathDiff) (leftOnly, rightOnly, noEqual, goodList []*PathDiff) {
+func SplitBySide(list []*PathDiff) (leftOnly, rightOnly, noEqual, goodList, IgnoredList []*PathDiff) {
 	for _, v := range list {
-		if v.PathLeft == "" {
+		if v.PathLeft == "" && !v.IsIgnored {
 			rightOnly = append(rightOnly, v)
-		} else if v.PathRight == "" {
+		} else if v.PathRight == "" && !v.IsIgnored {
 			leftOnly = append(leftOnly, v)
-		} else if !v.IsEqual {
+		} else if !v.IsEqual && !v.IsIgnored{
 			noEqual = append(noEqual, v)
+		} else if v.IsIgnored{
+			IgnoredList = append(IgnoredList, v)
 		} else {
 			goodList = append(goodList, v)
 		}
 	}
-
 	return
 }
 
 // Compare returns list of diffs
-func Compare(left, rigth []byte) ([]*PathDiff, error) {
+func Compare(left, right []byte, ignoreRules []string) ([]*PathDiff, error) {
 
-	var bodyLeft, bodyRigth map[string]interface{}
+	var bodyLeft, bodyRight map[string]interface{}
 	var err error
 
 	if bodyLeft, err = getJson(left); err != nil {
 		return nil, err
 	}
-	if bodyRigth, err = getJson(rigth); err != nil {
+	if bodyRight, err = getJson(right); err != nil {
 		return nil, err
 	}
 
 	pathsLeft := allPaths(bodyLeft, "")
-	pathsRigth := allPaths(bodyRigth, "")
+	pathsRight := allPaths(bodyRight, "")
 
-	checkList := comparePaths(pathsLeft, pathsRigth)
+	checkList, err := comparePaths(pathsLeft, pathsRight, ignoreRules)
 
-	return checkList, nil
+	return checkList, err
 }
 
 func getJson(data []byte) (map[string]interface{}, error) {
@@ -71,7 +74,7 @@ func getJson(data []byte) (map[string]interface{}, error) {
 
 func allPaths(body interface{}, way string) []path {
 
-	list := []path{}
+	var list []path
 
 	switch body.(type) {
 	case map[string]interface{}:
@@ -92,7 +95,7 @@ func allPaths(body interface{}, way string) []path {
 		list = mAppend(list, way, fmt.Sprintf("%T", body), body)
 	}
 
-	out := []path{}
+	var out []path
 	for _, v := range list {
 		v.path = strings.TrimPrefix(v.path, "/top")
 		if v.path != "" {
@@ -103,50 +106,57 @@ func allPaths(body interface{}, way string) []path {
 	return out
 }
 
-func mAppend(list []path, way, mytype string, body interface{}) []path {
+func mAppend(list []path, way, valueType string, body interface{}) []path {
 
 	if way == "" {
 		return list
 	}
 
 	p := path{
-		path:   way,
-		mytype: mytype,
-		value:  body,
+		path:      way,
+		valueType: valueType,
+		value:     body,
 	}
 	list = append(list, p)
 	return list
 }
 
-func comparePaths(left, rigth []path) []*PathDiff {
+// ignoreRule 为忽略的模板,一般为path或者path的正则
+func comparePaths(left, right []path, ignoreRules []string) ([]*PathDiff, error) {
 
-	out := []*PathDiff{}
+	var out []*PathDiff
 	rightCheck := map[string]bool{}
 
 	for _, vL := range left {
-		diff := fundInPath(true, vL, rigth)
+		diff, err0 := fundInPath(true, vL, right, ignoreRules)
+		if err0 != nil{
+			return out, err0
+		}
 		if diff.PathRight != "" {
 			rightCheck[diff.PathRight] = true
 		}
 		out = append(out, diff)
 	}
 
-	for _, vR := range rigth {
+	for _, vR := range right {
 		if !rightCheck[vR.path] {
-			diff := fundInPath(false, vR, left)
+			diff, err1 := fundInPath(false, vR, left, ignoreRules)
+			if err1 != nil{
+				return out, err1
+			}
 			out = append(out, diff)
 		}
 	}
-
-	return out
+	return out,nil
 }
 
-func fundInPath(leftOrRight bool, from path, p []path) *PathDiff {
+func fundInPath(leftOrRight bool, from path, p []path, ignoreRules []string) (*PathDiff, error) {
 
 	diff := &PathDiff{
 		PathLeft:  "",
 		PathRight: "",
 		IsEqual:   false,
+		IsIgnored: false,
 	}
 
 	if leftOrRight {
@@ -158,6 +168,11 @@ func fundInPath(leftOrRight bool, from path, p []path) *PathDiff {
 	}
 
 	for _, to := range p {
+		contain, err := isRegexpContain(ignoreRules, from.path)
+		if err != nil{
+			return diff, err
+		}
+		diff.IsIgnored = contain
 		if from.path == to.path {
 
 			if diff.PathLeft == "" {
@@ -167,20 +182,32 @@ func fundInPath(leftOrRight bool, from path, p []path) *PathDiff {
 				diff.PathRight = to.path
 				diff.ValueRight = to.value
 			}
-
 			diff.IsEqual = getEqual(from, to)
 			break
 		}
 	}
-
-	return diff
+	return diff, nil
 }
 
 func getEqual(vL, vR path) bool {
 
-	if vL.mytype != vR.mytype {
+	if vL.valueType != vR.valueType {
 		return false
 	}
 
 	return vL.value == vR.value
+}
+
+// 判断target是否满足特定规则，如果满足的话返回true，否则返回false，支持rule支持正则匹配
+func isRegexpContain(ruleList []string, target string) (bool, error){
+	for _, it := range ruleList {
+		matched, err := regexp.MatchString("^" + it + "$", target)
+		if err != nil{
+			return false, err
+		}
+		if  matched {
+			return true, nil
+		}
+	}
+	return false, nil
 }
